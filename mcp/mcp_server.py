@@ -1,7 +1,9 @@
+import os
 from fastmcp import FastMCP
 from fastmcp.server.dependencies import get_http_headers
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 import json
 import requests
 from qdrant_client import QdrantClient
@@ -10,7 +12,9 @@ from typing import Dict, Any, List, Literal
 from pydantic import BaseModel, Field
 
 from config import (
-    QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, EMBEDDING_SERVICE_URL,
+    QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, SYNTAX_COLLECTION_NAME,
+    PLATFORM_COLLECTION_NAME, CODE_COLLECTION_NAME,
+    EMBEDDING_SERVICE_URL,
     SERVER_HOST, SERVER_PORT, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
     MIN_SEARCH_LIMIT, SERVER_NAME,
     EMBEDDING_REQUEST_TIMEOUT, HEALTH_CHECK_TIMEOUT,
@@ -208,6 +212,357 @@ def search_1c_documentation(search_params: SearchRequestMCP) -> str:
         return f"Ошибка при поиске в документации 1С: {str(e)}"
 
 
+class SyntaxSearchRequestMCP(BaseModel):
+    """Модель запроса для поиска в синтаксис-помощнике 1С."""
+    query: str = Field(
+        description="Имя объекта/функции/свойства языка 1С либо смысловой запрос (укр/рос/англ) — например 'HTTPСервис', 'створення HTTP-сервіса', 'read file'",
+        min_length=1,
+        max_length=500
+    )
+    limit: int = Field(
+        default=DEFAULT_SEARCH_LIMIT,
+        description=f"Максимальное количество результатов поиска (по умолчанию {DEFAULT_SEARCH_LIMIT})",
+        ge=MIN_SEARCH_LIMIT,
+        le=MAX_SEARCH_LIMIT
+    )
+
+
+def syntax_search(query: str, limit: int) -> List[Dict[str, Any]]:
+    """Мультивекторный RRF-поиск в коллекции синтаксис-помощника 1С."""
+    query_embedding = get_query_embedding(query)
+    search_results = qdrant_client.query_points(
+        collection_name=SYNTAX_COLLECTION_NAME,
+        prefetch=[
+            Prefetch(query=query_embedding, using=OBJECT_NAME_VECTOR,
+                     limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+            Prefetch(query=query_embedding, using=FRIENDLY_NAME_VECTOR,
+                     limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
+        limit=limit
+    )
+    results = []
+    for r in search_results.points:
+        p = r.payload or {}
+        results.append({
+            "score": r.score,
+            "object_name": p.get("object_name", ""),
+            "title": p.get("title", ""),
+            "h1": p.get("h1", ""),
+            "h2": p.get("h2", ""),
+            "line": p.get("line"),
+            "doc": p.get("doc", ""),
+        })
+    return results
+
+
+@mcp.tool
+def search_1c_syntax(search_params: SyntaxSearchRequestMCP) -> str:
+    """Поиск в синтаксис-помощнике 1С: язык, платформенные объекты (HTTPСервис, Запрос, ТекстовыйДокумент и т.п.), функции, свойства.
+
+    Использовать когда вопрос про встроенный язык 1С и объекты платформы.
+    Для объектов конкретной конфигурации (справочники, документы, регистры) — search_1c_documentation.
+
+    Args:
+        search_params: Параметры поиска (query, limit)
+    """
+    try:
+        if not qdrant_client.collection_exists(SYNTAX_COLLECTION_NAME):
+            return f"Ошибка: коллекция '{SYNTAX_COLLECTION_NAME}' не существует в Qdrant."
+
+        results = syntax_search(search_params.query, search_params.limit)
+        if not results:
+            return f"По запросу '{search_params.query}' ничего не найдено в синтаксис-помощнике 1С (коллекция: {SYNTAX_COLLECTION_NAME})."
+
+        out = [f"Результаты поиска в синтаксис-помощнике 1С по запросу: '{search_params.query}' (коллекция: {SYNTAX_COLLECTION_NAME}, поиск: мультивекторный RRF)\n"]
+        for i, r in enumerate(results, 1):
+            path = " › ".join(x for x in [r["h1"], r["h2"], r["title"]] if x)
+            out.append(f"\nРезультат {i} (релевантность: {r['score']:.3f})")
+            out.append(f"Объект: {r['object_name']}")
+            out.append(f"Путь: {path}")
+            if r["line"]:
+                out.append(f"Источник: Full_Context_Help.md:{r['line']}")
+            out.append(f"Описание:")
+            out.append(r["doc"])
+            out.append("---")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Ошибка при поиске в синтаксис-помощнике 1С: {str(e)}"
+
+
+class PlatformSearchRequestMCP(BaseModel):
+    """Модель запроса для поиска в API платформы 1С (распарсенный shcntx_*.hbk)."""
+    query: str = Field(
+        description=(
+            "Имя элемента API: тип ('ТаблицаЗначений', 'HTTPСоединение'), "
+            "метод ('НайтиПоКоду', 'СтрНайти'), свойство ('Колонки'), "
+            "конструктор. Поддерживается смысловой поиск укр/рос/англ."
+        ),
+        min_length=1,
+        max_length=500,
+    )
+    kind: Literal[
+        "global_method", "global_property", "type",
+        "type_method", "type_property", "constructor",
+    ] | None = Field(
+        default=None,
+        description=(
+            "Фильтр по виду элемента: 'type' — типы, 'type_method' — методы типа, "
+            "'type_property' — свойства типа, 'constructor' — конструкторы, "
+            "'global_method' / 'global_property' — глобальные методы/свойства."
+        ),
+    )
+    parent_type: str | None = Field(
+        default=None,
+        description="Имя родительского типа (для type_method/type_property/constructor).",
+    )
+    limit: int = Field(
+        default=DEFAULT_SEARCH_LIMIT,
+        description=f"Максимальное количество результатов поиска (по умолчанию {DEFAULT_SEARCH_LIMIT})",
+        ge=MIN_SEARCH_LIMIT,
+        le=MAX_SEARCH_LIMIT,
+    )
+
+
+def platform_search(query: str, limit: int, kind: str | None = None,
+                    parent_type: str | None = None) -> List[Dict[str, Any]]:
+    """Мультивекторный RRF-поиск в коллекции 1c_platform с опциональными фильтрами."""
+    query_embedding = get_query_embedding(query)
+    must = []
+    if kind:
+        must.append({"key": "kind", "match": {"value": kind}})
+    if parent_type:
+        must.append({"key": "parent_type", "match": {"value": parent_type}})
+    qfilter = Filter(must=must) if must else None
+
+    search_results = qdrant_client.query_points(
+        collection_name=PLATFORM_COLLECTION_NAME,
+        prefetch=[
+            Prefetch(query=query_embedding, using=OBJECT_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+            Prefetch(query=query_embedding, using=FRIENDLY_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
+        limit=limit,
+    )
+    results = []
+    for r in search_results.points:
+        p = r.payload or {}
+        results.append({
+            "score": r.score,
+            "object_name": p.get("object_name", ""),
+            "friendly_name": p.get("friendly_name", ""),
+            "kind": p.get("kind", ""),
+            "parent_type": p.get("parent_type"),
+            "return_type": p.get("return_type", ""),
+            "doc": p.get("doc", ""),
+        })
+    return results
+
+
+@mcp.tool
+def search_1c_platform(search_params: PlatformSearchRequestMCP) -> str:
+    """Поиск по API платформы 1С Предприятие 8.3 (типы, методы, свойства, конструкторы).
+
+    Источник — распарсенный shcntx_*.hbk текущей установки платформы (актуально под версию).
+    Используйте, когда нужны:
+      - точные сигнатуры методов с типами возврата;
+      - полный список членов типа;
+      - конструкторы (Новый Тип(...));
+      - актуальные данные под установленную версию платформы.
+
+    Для разделов справочника по конфигурации (Справочники/Документы/Регистры) — search_1c_documentation.
+    Для развёрнутых описаний из Full_Context_Help.md — search_1c_syntax.
+
+    Args:
+        search_params: query + опциональные фильтры (kind, parent_type) + limit.
+    """
+    try:
+        if not qdrant_client.collection_exists(PLATFORM_COLLECTION_NAME):
+            return f"Ошибка: коллекция '{PLATFORM_COLLECTION_NAME}' не существует в Qdrant."
+
+        results = platform_search(
+            search_params.query,
+            search_params.limit,
+            kind=search_params.kind,
+            parent_type=search_params.parent_type,
+        )
+        if not results:
+            return (
+                f"По запросу '{search_params.query}' "
+                f"(kind={search_params.kind}, parent_type={search_params.parent_type}) "
+                f"ничего не найдено в '{PLATFORM_COLLECTION_NAME}'."
+            )
+
+        out = [
+            f"Результаты поиска по API платформы 1С: '{search_params.query}' "
+            f"(коллекция: {PLATFORM_COLLECTION_NAME}, мультивекторный RRF)\n"
+        ]
+        for i, r in enumerate(results, 1):
+            out.append(f"\nРезультат {i} (релевантность: {r['score']:.3f})")
+            out.append(f"Объект: {r['object_name']}")
+            out.append(f"Контекст: {r['friendly_name']}")
+            out.append(f"Вид: {r['kind']}")
+            if r.get("parent_type"):
+                out.append(f"Родительский тип: {r['parent_type']}")
+            if r.get("return_type"):
+                out.append(f"Тип значения: {r['return_type']}")
+            out.append("Описание:")
+            out.append(r["doc"])
+            out.append("---")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Ошибка при поиске в API платформы 1С: {str(e)}"
+
+
+class CodeSearchRequestMCP(BaseModel):
+    """Модель запроса для поиска по коду конфигурации (.bsl) — коллекция 1c_acc_code."""
+    query: str = Field(
+        description=(
+            "Имя процедуры/функции либо смысловой запрос (укр/рос/англ) — например "
+            "'ОбработкаПроведения', 'где рассчитывается НДС', 'обработчик при открытии формы'"
+        ),
+        min_length=1,
+        max_length=500,
+    )
+    object_type: str | None = Field(
+        default=None,
+        description=(
+            "Фильтр по типу объекта-владельца: 'CommonModule', 'Document', 'Catalog', "
+            "'Report', 'DataProcessor', 'InformationRegister', 'AccumulationRegister', "
+            "'CommonForm', 'ExchangePlan' и т.п."
+        ),
+    )
+    object_ref: str | None = Field(
+        default=None,
+        description="Конкретный объект-владелец в формате 'Тип.Имя', например 'Document.РеализацияТоваровУслуг'.",
+    )
+    routine_kind: Literal["procedure", "function"] | None = Field(
+        default=None,
+        description="Фильтр: 'procedure' — процедуры, 'function' — функции.",
+    )
+    limit: int = Field(
+        default=DEFAULT_SEARCH_LIMIT,
+        description=f"Максимальное количество результатов поиска (по умолчанию {DEFAULT_SEARCH_LIMIT})",
+        ge=MIN_SEARCH_LIMIT,
+        le=MAX_SEARCH_LIMIT,
+    )
+
+
+def code_search(query: str, limit: int, object_type: str | None = None,
+                object_ref: str | None = None,
+                routine_kind: str | None = None) -> List[Dict[str, Any]]:
+    """Мультивекторный RRF-поиск по коду конфигурации (1c_acc_code) с фильтрами."""
+    query_embedding = get_query_embedding(query)
+    must = []
+    if object_type:
+        must.append({"key": "object_type", "match": {"value": object_type}})
+    if object_ref:
+        must.append({"key": "object_ref", "match": {"value": object_ref}})
+    if routine_kind:
+        must.append({"key": "routine_kind", "match": {"value": routine_kind}})
+    qfilter = Filter(must=must) if must else None
+
+    search_results = qdrant_client.query_points(
+        collection_name=CODE_COLLECTION_NAME,
+        prefetch=[
+            Prefetch(query=query_embedding, using=OBJECT_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+            Prefetch(query=query_embedding, using=FRIENDLY_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
+        limit=limit,
+    )
+    results = []
+    for r in search_results.points:
+        p = r.payload or {}
+        results.append({
+            "score": r.score,
+            "object_name": p.get("object_name", ""),
+            "routine_kind": p.get("routine_kind", ""),
+            "signature": p.get("signature", ""),
+            "object_ref": p.get("object_ref", ""),
+            "module_kind": p.get("module_kind", ""),
+            "form_name": p.get("form_name", ""),
+            "export": p.get("export", False),
+            "directive": p.get("directive", ""),
+            "file": p.get("file", ""),
+            "line": p.get("line"),
+            "doc": p.get("doc", ""),
+        })
+    return results
+
+
+@mcp.tool
+def search_1c_acc_code(search_params: CodeSearchRequestMCP) -> str:
+    """Поиск по коду (.bsl) конкретной конфигурации (БухгалтерияДляУкраины / unpack_acc).
+
+    Коллекция 1c_acc_code: каждая точка — одна процедура/функция из модулей объектов,
+    форм, менеджеров и команд конфигурации. Используйте, когда нужно найти РЕАЛИЗАЦИЮ
+    в коде этой базы:
+      - конкретную процедуру/функцию по имени (ОбработкаПроведения, ПриОткрытии);
+      - где что-то вычисляется/заполняется по смыслу («где рассчитывается НДС»);
+      - обработчики событий объекта/формы.
+
+    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
+    Для языка и платформы — search_1c_syntax / search_1c_platform.
+
+    Args:
+        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
+    """
+    try:
+        if not qdrant_client.collection_exists(CODE_COLLECTION_NAME):
+            return f"Ошибка: коллекция '{CODE_COLLECTION_NAME}' не существует в Qdrant."
+
+        results = code_search(
+            search_params.query,
+            search_params.limit,
+            object_type=search_params.object_type,
+            object_ref=search_params.object_ref,
+            routine_kind=search_params.routine_kind,
+        )
+        if not results:
+            return (
+                f"По запросу '{search_params.query}' "
+                f"(object_type={search_params.object_type}, object_ref={search_params.object_ref}, "
+                f"routine_kind={search_params.routine_kind}) "
+                f"ничего не найдено в '{CODE_COLLECTION_NAME}'."
+            )
+
+        out = [
+            f"Результаты поиска по коду конфигурации: '{search_params.query}' "
+            f"(коллекция: {CODE_COLLECTION_NAME}, мультивекторный RRF)\n"
+        ]
+        for i, r in enumerate(results, 1):
+            loc = r["object_ref"]
+            if r.get("form_name"):
+                loc += f" / форма {r['form_name']}"
+            elif r.get("module_kind") and r["module_kind"] != "module":
+                loc += f" / {r['module_kind']}"
+            flags = []
+            if r.get("export"):
+                flags.append("Экспорт")
+            if r.get("directive"):
+                flags.append(r["directive"])
+            flag_text = f" [{', '.join(flags)}]" if flags else ""
+            out.append(f"\nРезультат {i} (релевантность: {r['score']:.3f})")
+            out.append(f"Процедура/функция: {r['object_name']} ({r['routine_kind']}){flag_text}")
+            out.append(f"Объект: {loc}")
+            if r.get("signature"):
+                out.append(f"Сигнатура: {r['signature']}")
+            if r.get("file"):
+                src = r["file"] + (f":{r['line']}" if r.get("line") else "")
+                out.append(f"Источник: {src}")
+            out.append("Код:")
+            out.append(r["doc"])
+            out.append("---")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Ошибка при поиске по коду конфигурации 1С: {str(e)}"
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def root(request: Request) -> JSONResponse:
     return JSONResponse({"message": "MCP 1C RAG Server запущен"})
@@ -297,6 +652,30 @@ async def manual_search(request: Request) -> JSONResponse:
         }, status_code=500)
 
 
+MCP_AUTH_TOKEN = os.getenv("MCP_AUTH_TOKEN", "").strip()
+AUTH_ALLOWLIST_PATHS = ("/health", "/")
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Захищає всі маршрути крім /health і / Bearer-token-ом з MCP_AUTH_TOKEN."""
+
+    async def dispatch(self, request: Request, call_next):
+        if not MCP_AUTH_TOKEN:
+            return await call_next(request)
+        if request.url.path in AUTH_ALLOWLIST_PATHS:
+            return await call_next(request)
+        auth = request.headers.get("authorization", "")
+        if auth != f"Bearer {MCP_AUTH_TOKEN}":
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host=SERVER_HOST,
-            port=SERVER_PORT, log_level="info")
+    if MCP_AUTH_TOKEN:
+        import uvicorn
+        http_app = mcp.http_app(transport="streamable-http", path="/mcp")
+        http_app.add_middleware(BearerAuthMiddleware)
+        uvicorn.run(http_app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
+    else:
+        mcp.run(transport="streamable-http", host=SERVER_HOST,
+                port=SERVER_PORT, log_level="info")
