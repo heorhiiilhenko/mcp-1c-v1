@@ -12,6 +12,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "1c_rag")
 SYNTAX_COLLECTION_NAME = os.getenv("SYNTAX_COLLECTION_NAME", "1c_syntax")
 PLATFORM_COLLECTION_NAME = os.getenv("PLATFORM_COLLECTION_NAME", "1c_platform")
 CODE_COLLECTION_NAME = os.getenv("CODE_COLLECTION_NAME", "1c_acc_code")
+UTP_CODE_COLLECTION_NAME = os.getenv("UTP_CODE_COLLECTION_NAME", "1c_utp_code")
 
 # Embedding service settings
 EMBEDDING_SERVICE_URL = os.getenv(

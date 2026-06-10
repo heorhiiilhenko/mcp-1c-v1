@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from config import (
     QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, SYNTAX_COLLECTION_NAME,
-    PLATFORM_COLLECTION_NAME, CODE_COLLECTION_NAME,
+    PLATFORM_COLLECTION_NAME, CODE_COLLECTION_NAME, UTP_CODE_COLLECTION_NAME,
     EMBEDDING_SERVICE_URL,
     SERVER_HOST, SERVER_PORT, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
     MIN_SEARCH_LIMIT, SERVER_NAME,
@@ -452,8 +452,13 @@ class CodeSearchRequestMCP(BaseModel):
 
 def code_search(query: str, limit: int, object_type: str | None = None,
                 object_ref: str | None = None,
-                routine_kind: str | None = None) -> List[Dict[str, Any]]:
-    """Мультивекторный RRF-поиск по коду конфигурации (1c_acc_code) с фильтрами."""
+                routine_kind: str | None = None,
+                collection: str = CODE_COLLECTION_NAME) -> List[Dict[str, Any]]:
+    """Мультивекторный RRF-поиск по коду конфигурации с фильтрами.
+
+    collection — имя коллекции Qdrant с кодом (.bsl): 1c_acc_code (Бухгалтерия)
+    или 1c_utp_code (УправлениеТорговымПредприятием). Структура точек идентична.
+    """
     query_embedding = get_query_embedding(query)
     must = []
     if object_type:
@@ -465,7 +470,7 @@ def code_search(query: str, limit: int, object_type: str | None = None,
     qfilter = Filter(must=must) if must else None
 
     search_results = qdrant_client.query_points(
-        collection_name=CODE_COLLECTION_NAME,
+        collection_name=collection,
         prefetch=[
             Prefetch(query=query_embedding, using=OBJECT_NAME_VECTOR,
                      filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
@@ -495,26 +500,11 @@ def code_search(query: str, limit: int, object_type: str | None = None,
     return results
 
 
-@mcp.tool
-def search_1c_acc_code(search_params: CodeSearchRequestMCP) -> str:
-    """Поиск по коду (.bsl) конкретной конфигурации (БухгалтерияДляУкраины / unpack_acc).
-
-    Коллекция 1c_acc_code: каждая точка — одна процедура/функция из модулей объектов,
-    форм, менеджеров и команд конфигурации. Используйте, когда нужно найти РЕАЛИЗАЦИЮ
-    в коде этой базы:
-      - конкретную процедуру/функцию по имени (ОбработкаПроведения, ПриОткрытии);
-      - где что-то вычисляется/заполняется по смыслу («где рассчитывается НДС»);
-      - обработчики событий объекта/формы.
-
-    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
-    Для языка и платформы — search_1c_syntax / search_1c_platform.
-
-    Args:
-        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
-    """
+def run_code_search(search_params: CodeSearchRequestMCP, collection: str) -> str:
+    """Общая реализация поиска по коду для коллекций 1c_acc_code / 1c_utp_code."""
     try:
-        if not qdrant_client.collection_exists(CODE_COLLECTION_NAME):
-            return f"Ошибка: коллекция '{CODE_COLLECTION_NAME}' не существует в Qdrant."
+        if not qdrant_client.collection_exists(collection):
+            return f"Ошибка: коллекция '{collection}' не существует в Qdrant."
 
         results = code_search(
             search_params.query,
@@ -522,18 +512,19 @@ def search_1c_acc_code(search_params: CodeSearchRequestMCP) -> str:
             object_type=search_params.object_type,
             object_ref=search_params.object_ref,
             routine_kind=search_params.routine_kind,
+            collection=collection,
         )
         if not results:
             return (
                 f"По запросу '{search_params.query}' "
                 f"(object_type={search_params.object_type}, object_ref={search_params.object_ref}, "
                 f"routine_kind={search_params.routine_kind}) "
-                f"ничего не найдено в '{CODE_COLLECTION_NAME}'."
+                f"ничего не найдено в '{collection}'."
             )
 
         out = [
             f"Результаты поиска по коду конфигурации: '{search_params.query}' "
-            f"(коллекция: {CODE_COLLECTION_NAME}, мультивекторный RRF)\n"
+            f"(коллекция: {collection}, мультивекторный RRF)\n"
         ]
         for i, r in enumerate(results, 1):
             loc = r["object_ref"]
@@ -561,6 +552,49 @@ def search_1c_acc_code(search_params: CodeSearchRequestMCP) -> str:
         return "\n".join(out)
     except Exception as e:
         return f"Ошибка при поиске по коду конфигурации 1С: {str(e)}"
+
+
+@mcp.tool
+def search_1c_acc_code(search_params: CodeSearchRequestMCP) -> str:
+    """Поиск по коду (.bsl) конфигурации БухгалтерияДляУкраины (unpack_acc).
+
+    Коллекция 1c_acc_code: каждая точка — одна процедура/функция из модулей объектов,
+    форм, менеджеров и команд конфигурации. Используйте, когда нужно найти РЕАЛИЗАЦИЮ
+    в коде этой базы:
+      - конкретную процедуру/функцию по имени (ОбработкаПроведения, ПриОткрытии);
+      - где что-то вычисляется/заполняется по смыслу («где рассчитывается НДС»);
+      - обработчики событий объекта/формы.
+
+    Это БУХГАЛТЕРИЯ. Для торговой конфигурации УТП — search_1c_utp_code.
+    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
+    Для языка и платформы — search_1c_syntax / search_1c_platform.
+
+    Args:
+        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
+    """
+    return run_code_search(search_params, CODE_COLLECTION_NAME)
+
+
+@mcp.tool
+def search_1c_utp_code(search_params: CodeSearchRequestMCP) -> str:
+    """Поиск по коду (.bsl) конфигурации УправлениеТорговымПредприятием (unpack_utp_comefor).
+
+    Коллекция 1c_utp_code: каждая точка — одна процедура/функция из модулей объектов,
+    форм, менеджеров и команд ТОРГОВОЙ конфигурации УТП (Управління торгівлею для
+    України, ред. 2.2 / come_for). Используйте, когда нужно найти РЕАЛИЗАЦИЮ в коде
+    именно этой базы:
+      - конкретную процедуру/функцию по имени (ОбработкаПроведения, ПриОткрытии);
+      - где что-то вычисляется/заполняется по смыслу («где формируется прайс», «ТСД ДатаМобайл»);
+      - обработчики событий объекта/формы.
+
+    Это ТОРГОВЛЯ (УТП). Для бухгалтерской конфигурации — search_1c_acc_code.
+    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
+    Для языка и платформы — search_1c_syntax / search_1c_platform.
+
+    Args:
+        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
+    """
+    return run_code_search(search_params, UTP_CODE_COLLECTION_NAME)
 
 
 @mcp.custom_route("/", methods=["GET"])
