@@ -22,25 +22,6 @@ services:
     networks:
       - mcp-network
 
-  # Сервис эмбеддингов
-  embedding-service:
-    build: ./embeddings
-    container_name: embedding-service
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./embeddings/config.json:/app/config.json:ro
-      - ./embeddings/models:/root/.cache/huggingface/hub
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://embedding-service:5000/health" ]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 60s # Longer start period for model loading
-    restart: unless-stopped
-    networks:
-      - mcp-network
-
   # Сервис загрузки данных
   loader:
     build: ./loader
@@ -53,7 +34,6 @@ services:
       - QDRANT_PORT=6333
     depends_on:
       - qdrant
-      - embedding-service
     networks:
       - mcp-network
 
@@ -68,9 +48,9 @@ services:
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
       - SERVER_PORT=8000
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
     depends_on:
       - qdrant
-      - embedding-service
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://mcp-server:8000/health" ]
       interval: 30s

@@ -14,6 +14,8 @@ from pydantic import BaseModel, Field
 from config import (
     QDRANT_HOST, QDRANT_PORT, COLLECTION_NAME, SYNTAX_COLLECTION_NAME,
     PLATFORM_COLLECTION_NAME, CODE_COLLECTION_NAME, UTP_CODE_COLLECTION_NAME,
+    UPP_CODE_COLLECTION_NAME, CONVERSION21_CODE_COLLECTION_NAME,
+    CONVERSION21_HELP_COLLECTION_NAME,
     EMBEDDING_SERVICE_URL,
     SERVER_HOST, SERVER_PORT, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT,
     MIN_SEARCH_LIMIT, SERVER_NAME,
@@ -597,6 +599,179 @@ def search_1c_utp_code(search_params: CodeSearchRequestMCP) -> str:
     return run_code_search(search_params, UTP_CODE_COLLECTION_NAME)
 
 
+@mcp.tool
+def search_1c_upp_code(search_params: CodeSearchRequestMCP) -> str:
+    """Поиск по коду (.bsl) конфигурации УправлениеПроизводственнымПредприятием (1cv8_unpacked).
+
+    Коллекция 1c_upp_code: каждая точка — одна процедура/функция из модулей объектов,
+    форм, менеджеров и команд ПРОИЗВОДСТВЕННОЙ конфигурации УПП (Управління
+    виробничим підприємством для України, ред. 1.3). Используйте, когда нужно найти
+    РЕАЛИЗАЦИЮ в коде именно этой базы:
+      - конкретную процедуру/функцию по имени (ОбработкаПроведения, ПриОткрытии);
+      - где что-то вычисляется/заполняется по смыслу («где рассчитывается себестоимость выпуска», «разузлование номенклатуры»);
+      - обработчики событий объекта/формы.
+
+    Это ПРОИЗВОДСТВО (УПП). Для торговой конфигурации УТП — search_1c_utp_code,
+    для бухгалтерской — search_1c_acc_code.
+    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
+    Для языка и платформы — search_1c_syntax / search_1c_platform.
+
+    Args:
+        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
+    """
+    return run_code_search(search_params, UPP_CODE_COLLECTION_NAME)
+
+
+@mcp.tool
+def search_1c_conversion21_code(search_params: CodeSearchRequestMCP) -> str:
+    """Поиск по коду (.bsl) конфигурации "Конвертация данных 2.1" (conversion21/unpacked).
+
+    Коллекция 1c_conversion21_code: каждая точка — одна процедура/функция из модулей
+    объектов, обычных и управляемых форм конфигурации обмена данными (правила
+    конвертации объектов/значений, правила регистрации, выгрузка/загрузка XML).
+    Используйте, когда нужно найти РЕАЛИЗАЦИЮ в коде именно этой базы:
+      - конкретную процедуру/функцию по имени (ВыполнитьВыгрузкуДанных, ПриОткрытии);
+      - где что-то вычисляется/заполняется по смыслу («где обрабатывается правило
+        конвертации объекта», «загрузка структуры метаданных»);
+      - обработчики событий объекта/формы.
+
+    Это КОНВЕРТАЦИЯ ДАННЫХ 2.1 (обмен/выгрузка-загрузка). Для бухгалтерской
+    конфигурации — search_1c_acc_code, торговой (УТП) — search_1c_utp_code,
+    производственной (УПП) — search_1c_upp_code.
+    Для описания состава объекта (реквизиты/табличные части) — search_1c_documentation.
+    Для языка и платформы — search_1c_syntax / search_1c_platform.
+
+    Args:
+        search_params: query + опциональные фильтры (object_type, object_ref, routine_kind) + limit.
+    """
+    return run_code_search(search_params, CONVERSION21_CODE_COLLECTION_NAME)
+
+
+class Conversion21HelpSearchRequestMCP(BaseModel):
+    """Модель запроса для поиска по справке (.html) конфигурации "Конвертация данных 2.1"."""
+    query: str = Field(
+        description=(
+            "Имя объекта метаданных или события/алгоритма правила, либо смысловой "
+            "запрос (укр/рос/англ) — например 'Правила конвертации объектов', "
+            "'АлгоритмПередВыгрузкойОбъекта', 'как настроить правило поиска'"
+        ),
+        min_length=1,
+        max_length=500,
+    )
+    kind: Literal["configuration", "object", "event"] | None = Field(
+        default=None,
+        description=(
+            "Фильтр по виду раздела справки: 'configuration' — общая справка "
+            "конфигурации, 'object' — справка по объекту метаданных (Catalog/"
+            "DataProcessor/Report), 'event' — карточка события/алгоритма правила "
+            "конвертации (АлгоритмПередВыгрузкойОбъекта и т.п.)."
+        ),
+    )
+    object_type: str | None = Field(
+        default=None,
+        description="Фильтр по типу объекта-владельца: 'Catalog', 'DataProcessor', 'Report', 'Event', 'Configuration'.",
+    )
+    limit: int = Field(
+        default=DEFAULT_SEARCH_LIMIT,
+        description=f"Максимальное количество результатов поиска (по умолчанию {DEFAULT_SEARCH_LIMIT})",
+        ge=MIN_SEARCH_LIMIT,
+        le=MAX_SEARCH_LIMIT,
+    )
+
+
+def conversion21_help_search(query: str, limit: int, kind: str | None = None,
+                              object_type: str | None = None) -> List[Dict[str, Any]]:
+    """Мультивекторный RRF-поиск по справке конфигурации "Конвертация данных 2.1"."""
+    query_embedding = get_query_embedding(query)
+    must = []
+    if kind:
+        must.append({"key": "kind", "match": {"value": kind}})
+    if object_type:
+        must.append({"key": "object_type", "match": {"value": object_type}})
+    qfilter = Filter(must=must) if must else None
+
+    search_results = qdrant_client.query_points(
+        collection_name=CONVERSION21_HELP_COLLECTION_NAME,
+        prefetch=[
+            Prefetch(query=query_embedding, using=OBJECT_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+            Prefetch(query=query_embedding, using=FRIENDLY_NAME_VECTOR,
+                     filter=qfilter, limit=limit * PREFETCH_LIMIT_MULTIPLIER),
+        ],
+        query=FusionQuery(fusion=Fusion.RRF),
+        limit=limit,
+    )
+    results = []
+    for r in search_results.points:
+        p = r.payload or {}
+        results.append({
+            "score": r.score,
+            "object_name": p.get("object_name", ""),
+            "friendly_name": p.get("friendly_name", ""),
+            "title": p.get("title", ""),
+            "kind": p.get("kind", ""),
+            "object_type": p.get("object_type", ""),
+            "object_ref": p.get("object_ref", ""),
+            "file": p.get("file", ""),
+            "doc": p.get("doc", ""),
+        })
+    return results
+
+
+@mcp.tool
+def search_1c_conversion21_help(search_params: Conversion21HelpSearchRequestMCP) -> str:
+    """Поиск по встроенной справке (.html) конфигурации "Конвертация данных 2.1" (conversion21/unpacked).
+
+    Коллекция 1c_conversion21_help: справочные тексты, которые штатно открываются
+    из самой конфигурации — F1 по объекту метаданных (Catalog/DataProcessor/Report)
+    и карточки-подсказки по событиям/алгоритмам правил конвертации (на что влияет
+    АлгоритмПередВыгрузкойОбъекта, АлгоритмПриЗагрузкеОбъекта и т.п.), плюс общая
+    справка конфигурации (help.html). Используйте, когда нужно объяснение НАЗНАЧЕНИЯ
+    объекта/события, а не его код (для кода — search_1c_conversion21_code).
+
+    Примеры вопросов:
+      - "что делает справочник Правила конвертации объектов";
+      - "когда вызывается АлгоритмПослеЗагрузкиОбъекта";
+      - "как работает группа свойств в правиле конвертации".
+
+    Args:
+        search_params: query + опциональные фильтры (kind, object_type) + limit.
+    """
+    try:
+        if not qdrant_client.collection_exists(CONVERSION21_HELP_COLLECTION_NAME):
+            return f"Ошибка: коллекция '{CONVERSION21_HELP_COLLECTION_NAME}' не существует в Qdrant."
+
+        results = conversion21_help_search(
+            search_params.query, search_params.limit,
+            kind=search_params.kind, object_type=search_params.object_type,
+        )
+        if not results:
+            return (
+                f"По запросу '{search_params.query}' (kind={search_params.kind}, "
+                f"object_type={search_params.object_type}) ничего не найдено в "
+                f"'{CONVERSION21_HELP_COLLECTION_NAME}'."
+            )
+
+        out = [
+            f"Результаты поиска по справке 'Конвертация данных 2.1': '{search_params.query}' "
+            f"(коллекция: {CONVERSION21_HELP_COLLECTION_NAME}, мультивекторный RRF)\n"
+        ]
+        for i, r in enumerate(results, 1):
+            out.append(f"\nРезультат {i} (релевантность: {r['score']:.3f})")
+            out.append(f"Объект/событие: {r['object_name']} ({r['kind']})")
+            out.append(f"Заголовок: {r['title']}")
+            if r.get("object_ref"):
+                out.append(f"Ссылка: {r['object_ref']}")
+            if r.get("file"):
+                out.append(f"Источник: {r['file']}")
+            out.append("Справка:")
+            out.append(r["doc"])
+            out.append("---")
+        return "\n".join(out)
+    except Exception as e:
+        return f"Ошибка при поиске по справке 'Конвертация данных 2.1': {str(e)}"
+
+
 @mcp.custom_route("/", methods=["GET"])
 async def root(request: Request) -> JSONResponse:
     return JSONResponse({"message": "MCP 1C RAG Server запущен"})
@@ -707,7 +882,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
 if __name__ == "__main__":
     if MCP_AUTH_TOKEN:
         import uvicorn
-        http_app = mcp.http_app(transport="streamable-http", path="/mcp")
+        http_app = mcp.http_app(
+            transport="streamable-http",
+            path="/mcp",
+            stateless_http=True,
+        )
         http_app.add_middleware(BearerAuthMiddleware)
         uvicorn.run(http_app, host=SERVER_HOST, port=SERVER_PORT, log_level="info")
     else:
