@@ -48,6 +48,26 @@ docker-compose up --build
 docker-compose down
 ```
 
+### Автозапуск при старті Ubuntu
+
+systemd-юніт `mcp-1c-v1.service` при завантаженні системи запускає `./start.sh`
+(основний стек, `docker compose up --build -d`), а після нього — `embeddings/`
+(він підключається до мережі `mcp-1c-v1_mcp-network`, тож мусить іти другим).
+Зупинка — навпаки: спершу `embeddings/`, потім `./stop.sh`.
+
+```bash
+sudo ./install-autostart.sh            # встановити в /etc/systemd/system і увімкнути
+sudo ./install-autostart.sh --remove   # вимкнути автозапуск (контейнери не чіпає)
+
+systemctl status mcp-1c-v1             # стан
+sudo systemctl restart mcp-1c-v1       # stop.sh + start.sh (і embeddings)
+journalctl -u mcp-1c-v1 -b             # лог запуску в поточному завантаженні
+```
+
+Шаблон юніта — `systemd/mcp-1c-v1.service` (`@USER@`/`@DIR@` підставляє
+інсталятор). Користувач має бути в групі `docker`.
+
+
 ## Доступные сервисы
 
 После запуска будут доступны:
@@ -85,7 +105,9 @@ mcp-1c-v1/
 ├── ПолучитьТекстСтруктурыКонфигурацииФайлами.epf # Обработка для 1С для выгрузки структуры
 ├── docker-compose.yml  # Конфигурация всех сервисов
 ├── start.sh            # Скрипт запуска
-└── stop.sh             # Скрипт остановки
+├── stop.sh             # Скрипт остановки
+├── install-autostart.sh # Автозапуск при старте системы (systemd)
+└── systemd/            # Шаблон юнита mcp-1c-v1.service
 ```
 
 ## Использование

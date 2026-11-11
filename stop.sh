@@ -5,6 +5,6 @@
 echo "🛑 Остановка всех сервисов..."
 
 # Остановка всех сервисов
-docker-compose down
+docker compose down
 
 echo "✅ Все сервисы остановлены!"

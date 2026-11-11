@@ -1,0 +1,31 @@
+# Автозапуск стеку mcp-1c-v1 при старті системи.
+# Шаблон: @USER@ і @DIR@ підставляє install-autostart.sh.
+#
+# Порядок важливий: embeddings/ — окремий compose-проєкт, який підключається
+# до зовнішньої мережі mcp-1c-v1_mcp-network, тож основний стек піднімається першим.
+
+[Unit]
+Description=MCP 1C RAG stack (Qdrant, MCP server, embedding service, loader, inspector)
+Documentation=file://@DIR@/README.md
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=@USER@
+WorkingDirectory=@DIR@
+# Основний стек — оригінальним скриптом ./start.sh (docker compose up --build -d).
+# start.sh не чіпає embeddings/, тому він піднімається окремо, після основного стеку.
+ExecStart=@DIR@/start.sh
+ExecStart=/usr/bin/docker compose -f embeddings/docker-compose.yml up -d
+# Зупинка у зворотному порядку: embeddings першим, інакше docker compose down
+# у stop.sh не зможе видалити мережу mcp-1c-v1_mcp-network (вона ще зайнята).
+ExecStop=/usr/bin/docker compose -f embeddings/docker-compose.yml stop
+ExecStop=@DIR@/stop.sh
+TimeoutStartSec=600
+TimeoutStopSec=180
+
+[Install]
+WantedBy=multi-user.target
